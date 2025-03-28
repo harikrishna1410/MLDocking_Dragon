@@ -9,8 +9,10 @@ from time import perf_counter
 import random
 import datetime
 import gc
-from dragon.native.process import current as current_process
-from dragon.native.machine import current
+driver_path = os.getenv("DRIVER_PATH")
+sys.path.append(driver_path)
+# from dragon.native.process import current as current_process
+# from dragon.native.machine import current
 import socket
 
 from inference.utils_transformer import ParamsJson, ModelArchitecture, pad
@@ -23,7 +25,7 @@ import tensorflow as tf
 
 # tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-driver_path = os.getenv("DRIVER_PATH")
+# driver_path = os.getenv("DRIVER_PATH")
 
 
 def eprint(*args, **kwargs):
@@ -59,6 +61,26 @@ def split_dict_keys(keys: List[str], size: int, proc: int) -> List[str]:
     random.shuffle(split_keys)
     return split_keys
 
+def split_smiles(nsmiles: int, size: int, proc: int) -> tuple:
+    """
+        uniformly split the smiles
+    """
+    num_keys = nsmiles
+
+    if nsmiles <= size:
+        raise ValueError("can't partition smiles size > nsmiles")
+
+    if num_keys / size - num_keys // size > 0:
+        num_keys_per_proc = num_keys // size + 1
+    else:
+        num_keys_per_proc = num_keys // size
+    start_ind = proc * num_keys_per_proc
+    end_ind = (proc + 1) * num_keys_per_proc
+    if proc != (size - 1):
+        return (start_ind,end_ind)
+    else:
+        return (start_ind,nsmiles)
+
 
 def process_inference_data(hyper_params: dict, tokenizer, smiles_raw: List[str]):
     """Preprosess the raw SMILES strings to generate the model input data
@@ -93,11 +115,13 @@ def infer(dd, num_procs, proc, continue_event, limit=None):
     gc.collect()
     # !!! DEBUG !!!
     debug = True
+    os.makedirs("debug", exist_ok=True)
+    log_file_name = f"debug/infer_worker_{proc}.log"
+    print(f"logfile is {log_file_name}")
     if debug:
         #myp = current_process()
         p = psutil.Process()
         core_list = p.cpu_affinity()
-        log_file_name = f"infer_worker_{proc}.log"
         print(f"Opening inference worker log {log_file_name}", flush=True)
         with open(log_file_name,'a') as f:
             f.write(f"\n\nNew run\n")
@@ -304,49 +328,91 @@ def infer(dd, num_procs, proc, continue_event, limit=None):
     return metrics
 ## Run main
 if __name__ == "__main__":
-    
     import pathlib
     import gzip
     import glob
-    
-    num_procs = 1
-    proc = 0
-    continue_event = None
-    dd = {}
+    import json
+    import argparse
 
+    parser = argparse.ArgumentParser(description="Launch inference with specified parameters.")
+    parser.add_argument("--nps", type=int, default=1, help="Number of processes.")
+    parser.add_argument("--pid", type=int, default=0, help="Process ID.")
+    args = parser.parse_args()
+
+    continue_event = None
+    nps = args.nps
+    pid = args.pid
 
     file_dir = os.getenv("DATA_PATH")
     all_files = glob.glob(file_dir+"*.gz")
-    files = all_files[0:1]
-    num_files = len(files)
-    file_tuples = [(i,fpath,i) for i,fpath in enumerate(files)]
+    all_files = all_files[:24]
+    num_files = len(all_files)
+    file_tuples = [(i,fpath,i) for i,fpath in enumerate(all_files)]
+    dd = {}
 
+    ##count nsmiles
+    nsmiles = 0
+    nsmiles_per_file = []
+    meta_data_fname = "./metadata.json"
+    if os.path.exists(meta_data_fname):
+        with open(meta_data_fname,"r") as f:
+            meta_data = json.load(f)
+    else:
+        meta_data = {}
 
-    for file_tuple in file_tuples:
-        file_index = file_tuple[0]
-        manager_index = file_tuple[2]
-        file_path = file_tuple[1]
+    for idx,file_path in enumerate(all_files):
+        f_name = os.path.basename(file_path)
+        f_extension = os.path.splitext(f_name)[-1].lstrip(".")
         
-        smiles = []
-        f_name = str(file_path).split("/")[-1]
-        f_extension = str(file_path).split("/")[-1].split(".")[-1]
-        if f_extension=="smi":
-            with file_path.open() as f:
-                for line in f:
-                    smile = line.split("\t")[0]
-                    smiles.append(smile)
-        elif f_extension=="gz":
-            with gzip.open(str(file_path), 'rt') as f:
-                for line in f:
-                    smile = line.split("\t")[0]
-                    smiles.append(smile)
+        if file_path in meta_data.keys():
+            my_nsmiles = meta_data[file_path]
+        else:
+            if f_extension=="smi":
+                with file_path.open() as f:
+                    my_nsmiles = sum(1 for _ in f) 
+            elif f_extension=="gz":
+                with gzip.open(str(file_path), 'rt') as f:
+                     my_nsmiles = sum(1 for _ in f)
+            meta_data[file_path] = my_nsmiles
+        nsmiles += my_nsmiles
+        nsmiles_per_file.append(nsmiles)
 
-        inf_results = [0.0 for i in range(len(smiles))]
-        key = f"{manager_index}_{file_index}"
-        f_name_list = f_name.split('.gz')
-        logname =  f_name_list[0].split(".")[0]+f_name_list[1]
-        dd[key] = {"f_name": f_name, 
-                   "smiles": smiles,
-                   "inf": inf_results}
+    if not os.path.exists(meta_data_fname):
+        with open(meta_data_fname,"w") as f:
+            json.dump(meta_data,f,indent=4)
+
+    start_idx, end_idx = split_smiles(nsmiles,nps,pid)
+    ##only read what I need
+    my_smiles = []
+    for i in range(len(all_files)):
+        fstart = 0 if i == 0 else nsmiles_per_file[i-1]
+        rel_start_id = max(start_idx - fstart,0)
+        rel_end_id = min(end_idx - fstart, nsmiles_per_file[i] - fstart)
+        ##this is a valid range. read
+        if rel_start_id < rel_end_id:
+            if f_extension == "smi":
+                with file_path.open() as f:
+                    for idx, line in enumerate(f):
+                        if rel_start_id <= idx < rel_end_id:
+                            smile = line.split("\t")[0]
+                            my_smiles.append(smile)
+            elif f_extension == "gz":
+                with gzip.open(str(file_path), 'rt') as f:
+                    for idx, line in enumerate(f):
+                        if rel_start_id <= idx < rel_end_id:
+                            smile = line.split("\t")[0]
+                            my_smiles.append(smile)
     
-    infer(dd, num_procs, proc, continue_event, limit=None)
+    print(f"number of my_slices nps:{nps}, pid:{pid}, nsmiles:{len(my_smiles)}")
+    inf_results = [0.0 for i in range(len(my_smiles))]
+    key = f"{pid}"
+    dd[key] = {"smiles": my_smiles,
+                "inf": inf_results}
+
+    ##this is so that it works with split_keys function
+    for i in range(nps):
+        key = f"{i}"
+        if(key != f"{pid}"):
+            dd[key] = {}
+
+    infer(dd, nps, pid, continue_event, limit=None)
