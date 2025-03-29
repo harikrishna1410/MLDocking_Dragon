@@ -216,50 +216,50 @@ def infer(dd, num_procs, proc, continue_event, limit=None):
     BATCH = hyper_params["general"]["batch_size"]
     cutoff = 9
     try:
-        # for key in split_keys:
-        for ikey in range(num_run):
-            if debug:
-                print(f"worker {proc} on key iter {ikey}", flush=True)
-            if check_model_iter(
-                dd, model_iter, continue_event
+        # # for key in split_keys:
+        # for ikey in range(num_run):
+        key = f"{proc}"
+        if debug:
+            print(f"worker {proc} on key iter {key}", flush=True)
+        if check_model_iter(
+            dd, model_iter, continue_event
             ):  # this check is to stop inference in async wf when model is retrained
-                ktic = perf_counter()
-                key = split_keys[ikey]
-                dict_tic = perf_counter()
-                try:
-                    print(f"worker {proc}: getting val from dd",flush=True)
-                    val = dd[key]
-                    print(f"worker {proc}: finished getting val from dd",flush=True)
-                except:
-                    print(
-                        f"Client raised exception on pulling from DDict: {e}",
-                        flush=True,
-                    )
-                dict_toc = perf_counter()
-                key_dictionary_time = dict_toc - dict_tic
-                if debug:
-                    print(
-                        f"worker {proc} pulled key {key} in {key_dictionary_time}s",
-                        flush=True,
-                    )
-
-                for kkey in val.keys():
-                    key_data_moved_size = sys.getsizeof(kkey)
-                    key_data_moved_size += sum([sys.getsizeof(v) for v in val[kkey]])
-
-                smiles_raw = val["smiles"]
-                x_inference = process_inference_data(
-                    hyper_params, tokenizer, smiles_raw
+            ktic = perf_counter()
+            dict_tic = perf_counter()
+            try:
+                print(f"worker {proc}: getting val from dd",flush=True)
+                val = dd[key]
+                print(f"worker {proc}: finished getting val from dd",flush=True)
+            except:
+                print(
+                    f"Client raised exception on pulling from DDict: {e}",
+                    flush=True,
                 )
-                output = model.predict(
-                    x_inference, batch_size=BATCH, verbose=0
-                ).flatten()
-                if debug:
-                    print(f"worker {proc} inference on key {key}", flush=True)
+            dict_toc = perf_counter()
+            key_dictionary_time = dict_toc - dict_tic
+            if debug:
+                print(
+                    f"worker {proc} pulled key {key} in {key_dictionary_time}s",
+                    flush=True,
+                )
 
-                sort_index = np.flip(np.argsort(output)).tolist()
-                smiles_sorted = [smiles_raw[i] for i in sort_index]
-                pred_sorted = [
+            for kkey in val.keys():
+                key_data_moved_size = sys.getsizeof(kkey)
+                key_data_moved_size += sum([sys.getsizeof(v) for v in val[kkey]])
+
+            smiles_raw = val["smiles"]
+            x_inference = process_inference_data(
+                hyper_params, tokenizer, smiles_raw
+                )
+            output = model.predict(
+                x_inference, batch_size=BATCH, verbose=0
+            ).flatten()
+            if debug:
+                print(f"worker {proc} inference on key {key}", flush=True)
+
+            sort_index = np.flip(np.argsort(output)).tolist()
+            smiles_sorted = [smiles_raw[i] for i in sort_index]
+            pred_sorted = [
                     (
                         output[sort_index[i]].item()
                         if output[sort_index[i]] > cutoff
@@ -268,48 +268,45 @@ def infer(dd, num_procs, proc, continue_event, limit=None):
                     for i in range(len(sort_index))
                 ]
 
-                val["smiles"] = smiles_sorted
-                val["inf"] = pred_sorted
-                val["model_iter"] = [model_iter for i in range(len(smiles_sorted))]
+            val["smiles"] = smiles_sorted
+            val["inf"] = pred_sorted
+            val["model_iter"] = [model_iter for i in range(len(smiles_sorted))]
 
-                dict_tic = perf_counter()
-                try:
-                    dd[key] = val
-                except:
-                    print(
-                        f"Client raised exception on DDict assignment: {e}", flush=True
-                    )
-                dict_toc = perf_counter()
-                key_dictionary_time += dict_toc - dict_tic
-                if debug:
-                    print(
-                        f"worker {proc} put key {key} in {key_dictionary_time}s",
-                        flush=True,
-                    )
+            dict_tic = perf_counter()
+            try:
+                dd[key] = val
+            except:
+                print(
+                    f"Client raised exception on DDict assignment: {e}", flush=True
+                )
+            dict_toc = perf_counter()
+            key_dictionary_time += dict_toc - dict_tic
+            if debug:
+                print(
+                    f"worker {proc} put key {key} in {key_dictionary_time}s",
+                    flush=True,
+                )
 
-                for kkey in val.keys():
-                    key_data_moved_size += sys.getsizeof(kkey)
-                    key_data_moved_size += sum([sys.getsizeof(v) for v in val[kkey]])
+            for kkey in val.keys():
+                key_data_moved_size += sys.getsizeof(kkey)
+                key_data_moved_size += sum([sys.getsizeof(v) for v in val[kkey]])
 
-                num_smiles += len(smiles_sorted)
+            num_smiles += len(smiles_sorted)
 
-                ktoc = perf_counter()
-                key_time = ktoc - ktic
-                dictionary_time += key_dictionary_time
-                data_moved_size += key_data_moved_size
+            ktoc = perf_counter()
+            key_time = ktoc - ktic
+            dictionary_time += key_dictionary_time
+            data_moved_size += key_data_moved_size
 
-                if debug:
-                    with open(log_file_name, "a") as f:
-                        f.write(
+            if debug:
+                with open(log_file_name, "a") as f:
+                    f.write(
                             f"Performed inference on key {key} {key_time=} {len(smiles_sorted)=} {key_data_moved_size=} {key_dictionary_time=}\n"
                         )
-                    print(
-                        f"Performed inference on key {key} {key_time=} {len(smiles_sorted)=} {key_data_moved_size=} {key_dictionary_time=}",
-                        flush=True,
-                    )
-            else:
-                break
-
+                print(
+                    f"Performed inference on key {key} {key_time=} {len(smiles_sorted)=} {key_data_moved_size=} {key_dictionary_time=}",
+                    flush=True,
+                )
     except Exception as e:
         exc_type, exc_obj, exc_tb = sys.exc_info()
         with open(log_file_name, "a") as f:
@@ -337,15 +334,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch inference with specified parameters.")
     parser.add_argument("--nps", type=int, default=1, help="Number of processes.")
     parser.add_argument("--pid", type=int, default=0, help="Process ID.")
+    parser.add_argument("--nfiles", type=int, default=1, help="number of files to read")
     args = parser.parse_args()
 
     continue_event = None
     nps = args.nps
     pid = args.pid
+    nfiles = args.nfiles
 
     file_dir = os.getenv("DATA_PATH")
     all_files = glob.glob(file_dir+"*.gz")
-    all_files = all_files[:24]
+    all_files = all_files[:nfiles]
     num_files = len(all_files)
     file_tuples = [(i,fpath,i) for i,fpath in enumerate(all_files)]
     dd = {}
